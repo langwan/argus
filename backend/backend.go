@@ -25,6 +25,9 @@ func main() {
 		})
 	})
 
+	api := r.Group("/api")
+	registerApi(api)
+
 	r.Run(config.Host + ":" + strconv.Itoa(config.Port))
 }
 
