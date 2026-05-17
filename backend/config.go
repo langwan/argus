@@ -7,18 +7,22 @@ import (
 )
 
 type Config struct {
-	Port                int
-	Host                string
-	DataDir             string
-	FFmpegPath          string
-	FFprobePath         string
-	SubtitleCommonWords string
+	Port                int    `yaml:"port"`
+	Host                string `yaml:"host"`
+	SenseVoicePort      int    `yaml:"sensevoice_port"`
+	DataDir             string `yaml:"data_dir"`
+	FFmpegPath          string `yaml:"ffmpeg_path"`
+	FFprobePath         string `yaml:"ffprobe_path"`
+	SubtitleCommonWords string `yaml:"subtitle_common_words"`
+	ASR                 string `yaml:"asr"`
 }
 
 var config Config = Config{
-	Port:    8090,
-	Host:    "localhost",
-	DataDir: "./data",
+	Port:           8090,
+	SenseVoicePort: 8091,
+	Host:           "localhost",
+	DataDir:        "./data",
+	ASR:            ASRProviderSenseVoice,
 }
 
 func loadConfig() error {
@@ -26,14 +30,10 @@ func loadConfig() error {
 	if err != nil {
 		return err
 	}
-	var cfg struct {
-		FfmpegPath  string `yaml:"ffmpeg_path"`
-		FFprobePath string `yaml:"ffprobe_path"`
-	}
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+
+	if err := yaml.Unmarshal(data, &config); err != nil {
 		return err
 	}
-	config.FFmpegPath = cfg.FfmpegPath
-	config.FFprobePath = cfg.FFprobePath
+
 	return nil
 }

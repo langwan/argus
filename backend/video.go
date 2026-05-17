@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -75,10 +76,14 @@ func newUploadVideoTask(ctx *TaskContext) error {
 	}
 
 	go func() {
+		defer os.Remove(ctx.UploadFilePath)
 		tasks := []VideoTaskFunc{
 			uploadVideoTaskStepTranscode,
+			uploadVideoTaskStepAudio,
+			uploadVideoTaskStepSubtitle,
+			uploadVideoTaskStepCover,
 		}
-		// 2. 用一个循环逐个执行
+		// Execute tasks one by one in a loop
 		for _, task := range tasks {
 			err := task(ctx)
 			if err != nil {
@@ -132,16 +137,15 @@ func uploadVideoTaskStepUpload(ctx *TaskContext) error {
 func uploadVideoTaskStepTranscode(ctx *TaskContext) error {
 	GlobalDB.Model(&Video{}).Where("id = ?", ctx.VideoId).Update("task_step", TaskStepTranscode)
 	log.Printf("Transcoding video %d\n", ctx.VideoId)
-	outputFileName := fmt.Sprintf("%d-1080p.mp4", ctx.VideoId)
-	videoBaseDir := filepath.Join(config.DataDir, "store/videos")
-	outputPath := filepath.Join(videoBaseDir, fmt.Sprintf("%d", ctx.VideoId), outputFileName)
+
+	transcodedPath := getVideoFilePath(ctx, VideoFileTypeTranscoded)
 
 	video := Video{}
 
 	if err := GlobalDB.Where(&Video{ID: ctx.VideoId}).First(&video).Error; err != nil {
 		return err
 	}
-
+	log.Printf("Transcoding uploadfile path %s, title: %s\n", ctx.UploadFilePath, video.Title)
 	width, height, err := getVideoResolution(ctx.UploadFilePath)
 	if err != nil {
 		return fmt.Errorf("Failed to detect video resolution: %v", err)
@@ -240,22 +244,22 @@ func uploadVideoTaskStepTranscode(ctx *TaskContext) error {
 		"-c:a", "aac",
 		"-b:a", "192k",
 		"-y",
-		outputPath,
+		transcodedPath,
 	}
 
-	// 创建命令
+	// Create command
 	cmd := exec.Command(config.FFmpegPath, args...)
 
-	// 打印完整命令方便调试
+	// Print full command for debugging
 	fmt.Printf("Executing transcoding command: %s %v\n", config.FFmpegPath, args)
 
-	// 获取输出（包含标准输出和错误输出）
+	// Get output (includes stdout and stderr)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("Video transcoding failed: %v, Details: %s", err, string(output))
 	}
 
-	fmt.Println("Video transcoding completed! Output path:", outputPath)
+	fmt.Println("Video transcoding completed! Output path:", transcodedPath)
 	return nil
 
 }
@@ -263,7 +267,7 @@ func getVideoResolution(videoPath string) (int, int, error) {
 
 	cmd := exec.Command(config.FFprobePath, "-v", "error", "-select_streams", "v:0",
 		"-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", videoPath)
-
+	log.Printf("Executing ffprobe command: %s %v\n", config.FFprobePath, videoPath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		cmd2 := exec.Command(config.FFmpegPath, "-i", videoPath)
@@ -384,4 +388,147 @@ func getVideoRotation(videoPath string) (int, error) {
 	}
 
 	return 0, nil
+}
+
+func uploadVideoTaskStepAudio(ctx *TaskContext) error {
+	GlobalDB.Model(&Video{}).Where("id = ?", ctx.VideoId).Update("task_step", TaskStepAudio)
+	transcodedPath := getVideoFilePath(ctx, VideoFileTypeTranscoded)
+	audioPath := getVideoFilePath(ctx, VideoFileTypeAudio)
+
+	cmd := exec.Command(config.FFmpegPath, "-i", transcodedPath, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", audioPath, "-y")
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Audio conversion failed: %v", err)
+		return fmt.Errorf("audio conversion failed: %v", err)
+	}
+
+	return nil
+}
+
+func uploadVideoTaskStepSubtitle(ctx *TaskContext) error {
+	GlobalDB.Model(&Video{}).Where("id = ?", ctx.VideoId).Update("task_step", TaskStepSubtitle)
+
+	audioPath := getVideoFilePath(ctx, VideoFileTypeAudio)
+
+	asrProvider, err := GetASRProvider(config.ASR)
+	if err != nil {
+		return fmt.Errorf("Failed to get ASR provider: %v", err)
+	}
+
+	subtitlePath := getVideoFilePath(ctx, VideoFileTypeSubtitle)
+
+	err = asrProvider.TranscribeToSRT(audioPath, "zh", config.SubtitleCommonWords, subtitlePath)
+	if err != nil {
+		return fmt.Errorf("[%s] Recognition failed: %v", asrProvider.Name(), err)
+	}
+
+	return nil
+}
+
+func uploadVideoTaskStepCover(ctx *TaskContext) error {
+	GlobalDB.Model(&Video{}).Where("id = ?", ctx.VideoId).Update("task_step", TaskStepCover)
+	transcodedPath := getVideoFilePath(ctx, VideoFileTypeTranscoded)
+	coverPath := getVideoFilePath(ctx, VideoFileTypeCover)
+	duration, err := getVideoDuration(transcodedPath)
+	if err != nil {
+		log.Printf("Warning: Failed to get video duration, using default 5th second: %v", err)
+		duration = 10
+	}
+
+	// ========== Core Frame Capture Strategy ==========
+	var captureTime float64
+	const standardTime = 5.0
+
+	if duration >= standardTime {
+		// Video duration >= 5 seconds: Use fixed 5th second for consistency
+		captureTime = standardTime
+		log.Printf("Video duration: %.2fs >= 5 seconds, using standard capture time: %.2f seconds", duration, captureTime)
+	} else {
+		// Video duration < 5 seconds: Use middle frame, minimum 0.5 seconds (avoid black screen)
+		captureTime = math.Max(0.5, duration/2)
+		log.Printf("Video duration: %.2fs < 5 seconds, using middle point: %.2f seconds", duration, captureTime)
+	}
+
+	// Format time as HH:MM:SS format
+	seconds := int(captureTime)
+	frac := captureTime - float64(seconds)
+	hours := seconds / 3600
+	minutes := (seconds % 3600) / 60
+	secs := seconds % 60
+	timeStr := fmt.Sprintf("%02d:%02d:%02d.%.0f", hours, minutes, secs, frac*1000)
+
+	// Use ffmpeg to capture frame at specified time as cover
+	// -strict unofficial: Fix FFmpeg 8.x strict YUV range check issue with mjpeg
+	cmd := exec.Command(config.FFmpegPath, "-i", transcodedPath, "-ss", timeStr, "-vframes", "1", "-q:v", "2", "-strict", "unofficial", coverPath, "-y")
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// If failed, try using 1st second as fallback
+		cmd2 := exec.Command(config.FFmpegPath, "-i", transcodedPath, "-ss", "00:00:01", "-vframes", "1", "-q:v", "2", "-strict", "unofficial", coverPath, "-y")
+		output2, err2 := cmd2.CombinedOutput()
+		if err2 != nil {
+			return fmt.Errorf("Cover capture failed: %v, output: %s", err2, string(output)+"\nRetry: "+string(output2))
+		}
+	}
+
+	return nil
+}
+
+func getVideoPath(id int64) string {
+	return filepath.Join(config.DataDir, "store/videos/"+strconv.FormatInt(id, 10))
+}
+
+type VideoFileType string
+
+const (
+	VideoFileTypeAudio      VideoFileType = "audio"
+	VideoFileTypeTranscoded VideoFileType = "transcoded"
+	VideoFileTypeSubtitle   VideoFileType = "subtitle"
+	VideoFileTypeCover      VideoFileType = "cover"
+)
+
+func getVideoFilePath(ctx *TaskContext, videoType VideoFileType) string {
+	videoBaseDir := filepath.Join(config.DataDir, fmt.Sprintf("store/videos/%d", ctx.VideoId))
+	switch videoType {
+	case VideoFileTypeTranscoded:
+		return filepath.Join(videoBaseDir, "transcoded.mp4")
+	case VideoFileTypeAudio:
+		return filepath.Join(videoBaseDir, "audio.wav")
+	case VideoFileTypeSubtitle:
+		return filepath.Join(videoBaseDir, "subtitle.srt")
+	case VideoFileTypeCover:
+		return filepath.Join(videoBaseDir, "cover.jpg")
+	}
+
+	return videoBaseDir
+}
+
+type CoverSizeType string
+
+const (
+	CoverSizeType16x9 CoverSizeType = "16x9"
+	CoverSizeType9x16 CoverSizeType = "9x16"
+	CoverSizeType4x3  CoverSizeType = "4x3"
+	CoverSizeType3x4  CoverSizeType = "3x4"
+)
+
+func getVideoFileCoverPath(ctx *TaskContext, sizeType CoverSizeType) string {
+	videoBaseDir := filepath.Join(config.DataDir, fmt.Sprintf("store/videos/%d", ctx.VideoId))
+	return filepath.Join(videoBaseDir, fmt.Sprintf("cover_%s.jpg", sizeType))
+}
+func getVideoDuration(videoPath string) (float64, error) {
+	cmd := exec.Command(config.FFmpegPath, "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=duration", "-of", "csv=p=0", videoPath)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("Failed to get video duration: %v, output: %s", err, string(output))
+	}
+
+	durationStr := strings.TrimSpace(string(output))
+	duration, err := strconv.ParseFloat(durationStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("Failed to parse duration: %v", err)
+	}
+
+	return duration, nil
 }

@@ -4,3 +4,5 @@ bin/
 argus.exe
 samples/
 data/
+venv/
+AGENTS.md

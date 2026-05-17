@@ -7,6 +7,7 @@ type TaskStep string
 const (
 	TaskStepUpload    TaskStep = "upload"
 	TaskStepTranscode TaskStep = "transcode"
+	TaskStepAudio     TaskStep = "audio"
 	TaskStepSubtitle  TaskStep = "subtitle"
 	TaskStepCover     TaskStep = "cover"
 )
