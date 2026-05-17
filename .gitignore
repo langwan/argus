@@ -1,1 +1,6 @@
 backend/data/store/db/argus.db
+backend/config.yml
+bin/
+argus.exe
+samples/
+data/

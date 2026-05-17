@@ -11,6 +11,7 @@ import (
 )
 
 func main() {
+	loadConfig()
 	initDataDir()
 	initDB()
 
